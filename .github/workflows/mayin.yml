@@ -1,0 +1,114 @@
+name: Paperspace Win11 RDP (no-poll, fail if no IP)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400   # ~6h40 buffer
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl openssl
+
+      - name: Generate random credentials
+        id: gen
+        run: |
+          MACHINE_NAME="rdp-$(openssl rand -hex 4)"
+          USERNAME="u$(openssl rand -hex 3)"
+          PASSWORD="$(openssl rand -base64 15 | tr -dc 'A-Za-z0-9' | head -c12)"
+          echo "MACHINE_NAME=$MACHINE_NAME" >> $GITHUB_OUTPUT
+          echo "USERNAME=$USERNAME" >> $GITHUB_OUTPUT
+          echo "PASSWORD=$PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Detect Windows 11 image (single check)
+        id: detect
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+        run: |
+          API="https://api.paperspace.io"
+          RESP=$(curl -s -H "X-Api-Key: $PAPERSPACE_API_KEY" "$API/templates/getTemplates")
+          IMAGE=$(echo "$RESP" | jq -r '.[] | select(.name | test("Windows-11";"i")) | .name' | head -n1)
+          if [ -z "$IMAGE" ]; then
+            IMAGE="Windows-Server-2019"
+          fi
+          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Create Paperspace machine (single create)
+        id: create
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_NAME: ${{ steps.gen.outputs.MACHINE_NAME }}
+          USERNAME: ${{ steps.gen.outputs.USERNAME }}
+          PASSWORD: ${{ steps.gen.outputs.PASSWORD }}
+          IMAGE: ${{ steps.detect.outputs.IMAGE }}
+        run: |
+          API="https://api.paperspace.io"
+          PAYLOAD=$(jq -n \
+            --arg name "$MACHINE_NAME" \
+            --arg region "NY2" \
+            --arg machineType "RTX4000" \
+            --arg image "$IMAGE" \
+            --arg script "powershell -ExecutionPolicy Bypass -Command \"net user $USERNAME $PASSWORD /add; net localgroup Administrators $USERNAME /add; Write-Host 'USER=$USERNAME PASSWORD=$PASSWORD'\"" \
+            '{machineName:$name, region:$region, machineType:$machineType, image:$image, billingType:"hourly", script:$script}')
+          RESP=$(curl -s -X POST "$API/machines/create" \
+            -H "X-Api-Key: $PAPERSPACE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD")
+          echo "Create response (truncated):"
+          echo "$RESP" | head -n 200
+          ID=$(echo "$RESP" | jq -r '.id // .machineId // empty')
+          if [ -z "$ID" ]; then
+            echo "ERROR: could not get machine id from create response. Failing."
+            echo "Full response: $RESP"
+            exit 1
+          fi
+          echo "MACHINE_ID=$ID" >> $GITHUB_OUTPUT
+
+      - name: Single fetch for public IP (no poll) and fail if missing
+        id: fetch_once
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_ID: ${{ steps.create.outputs.MACHINE_ID }}
+        run: |
+          API="https://api.paperspace.io"
+          # give a brief pause to let provider allocate resources (single fixed wait)
+          sleep 30
+          RESP=$(curl -s -H "X-Api-Key: $PAPERSPACE_API_KEY" "$API/machines/getMachine?machineId=$MACHINE_ID")
+          echo "Machine info (truncated):"
+          echo "$RESP" | head -n 200
+          IP=$(echo "$RESP" | jq -r '.publicIp // empty')
+          if [ -z "$IP" ] || [ "$IP" = "null" ]; then
+            echo "ERROR: No public IP assigned (single-check). Failing as requested."
+            exit 1
+          fi
+          echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+
+      - name: Show RDP Credentials (only if IP present)
+        run: |
+          echo "=== RDP LOGIN ==="
+          echo "IP: ${{ steps.fetch_once.outputs.PUBLIC_IP }}"
+          echo "USER: ${{ steps.gen.outputs.USERNAME }}"
+          echo "PASS: ${{ steps.gen.outputs.PASSWORD }}"
+          echo "================="
+
+      - name: Keep alive 6h then shutdown (stop)
+        if: success()   # only run if previous steps succeeded
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_ID: ${{ steps.create.outputs.MACHINE_ID }}
+        run: |
+          API="https://api.paperspace.io"
+          START=$(date +%s)
+          END=$((START + 6*3600))
+          echo "Keeping VM alive for 6 hours..."
+          while [ $(date +%s) -lt $END ]; do
+            sleep 300
+          done
+          echo "Stopping VM now..."
+          curl -s -X POST "$API/machines/$MACHINE_ID/stop" -H "X-Api-Key: $PAPERSPACE_API_KEY" || true
+          echo "VM stopped."
+          
