@@ -1,0 +1,112 @@
+name: Paperspace Windows 11 RDP (auto-detect & shutdown)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400   # ~6h40 buffer
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl openssl
+
+      - name: Generate random credentials
+        id: gen
+        run: |
+          MACHINE_NAME="rdp-$(openssl rand -hex 4)"
+          USERNAME="u$(openssl rand -hex 3)"
+          PASSWORD="$(openssl rand -base64 15 | tr -dc 'A-Za-z0-9' | head -c12)"
+          echo "MACHINE_NAME=$MACHINE_NAME" >> $GITHUB_OUTPUT
+          echo "USERNAME=$USERNAME" >> $GITHUB_OUTPUT
+          echo "PASSWORD=$PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Detect Windows 11 image
+        id: detect
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+        run: |
+          API="https://api.paperspace.io"
+          RESP=$(curl -s -H "X-Api-Key: $PAPERSPACE_API_KEY" "$API/templates/getTemplates")
+          IMAGE=$(echo "$RESP" | jq -r '.[] | select(.name | test("Windows-11";"i")) | .name' | head -n1)
+          if [ -z "$IMAGE" ]; then
+            IMAGE="Windows-Server-2019"
+          fi
+          echo "Selected IMAGE=$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Create Paperspace machine
+        id: create
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_NAME: ${{ steps.gen.outputs.MACHINE_NAME }}
+          USERNAME: ${{ steps.gen.outputs.USERNAME }}
+          PASSWORD: ${{ steps.gen.outputs.PASSWORD }}
+          IMAGE: ${{ steps.detect.outputs.IMAGE }}
+        run: |
+          API="https://api.paperspace.io"
+          PAYLOAD=$(jq -n \
+            --arg name "$MACHINE_NAME" \
+            --arg region "NY2" \
+            --arg machineType "RTX4000" \
+            --arg image "$IMAGE" \
+            --arg script "powershell -ExecutionPolicy Bypass -Command \"net user $USERNAME $PASSWORD /add; net localgroup Administrators $USERNAME /add; Write-Host 'USER=$USERNAME PASSWORD=$PASSWORD'\"" \
+            '{machineName:$name, region:$region, machineType:$machineType, image:$image, billingType:"hourly", script:$script}')
+          
+          RESP=$(curl -s -X POST "$API/machines/create" \
+            -H "X-Api-Key: $PAPERSPACE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD")
+
+          echo "Create response: $RESP"
+          ID=$(echo "$RESP" | jq -r '.id // .machineId // empty')
+          echo "MACHINE_ID=$ID" >> $GITHUB_OUTPUT
+
+      - name: Poll until IP is assigned
+        id: poll
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_ID: ${{ steps.create.outputs.MACHINE_ID }}
+        run: |
+          API="https://api.paperspace.io"
+          echo "Waiting for public IP..."
+          for i in {1..60}; do
+            RESP=$(curl -s -H "X-Api-Key: $PAPERSPACE_API_KEY" "$API/machines/getMachine?machineId=$MACHINE_ID")
+            IP=$(echo "$RESP" | jq -r '.publicIp // empty')
+            if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+              echo "Found IP: $IP"
+              echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for IP"
+          exit 1
+
+      - name: Show RDP Credentials
+        run: |
+          echo "=== RDP LOGIN ==="
+          echo "IP: ${{ steps.poll.outputs.PUBLIC_IP }}"
+          echo "USER: ${{ steps.gen.outputs.USERNAME }}"
+          echo "PASS: ${{ steps.gen.outputs.PASSWORD }}"
+          echo "================="
+
+      - name: Keep alive 6h then shutdown
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_ID: ${{ steps.create.outputs.MACHINE_ID }}
+        run: |
+          API="https://api.paperspace.io"
+          START=$(date +%s)
+          END=$((START + 6*3600))
+          echo "Keeping VM alive for 6h..."
+          while [ $(date +%s) -lt $END ]; do
+            sleep 300
+          done
+          echo "Stopping VM..."
+          curl -s -X POST "$API/machines/$MACHINE_ID/stop" -H "X-Api-Key: $PAPERSPACE_API_KEY" || true
+          echo "VM stopped."
+          
