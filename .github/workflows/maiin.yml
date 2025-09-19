@@ -1,0 +1,126 @@
+name: Paperspace Linux RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400   # ~6h40 buffer
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl openssl
+
+      - name: Generate random credentials
+        id: gen
+        run: |
+          MACHINE_NAME="linux-rdp-$(openssl rand -hex 4)"
+          USERNAME="u$(openssl rand -hex 3)"
+          PASSWORD="$(openssl rand -base64 15 | tr -dc 'A-Za-z0-9' | head -c12)"
+          echo "MACHINE_NAME=$MACHINE_NAME" >> $GITHUB_OUTPUT
+          echo "USERNAME=$USERNAME" >> $GITHUB_OUTPUT
+          echo "PASSWORD=$PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Detect Ubuntu template
+        id: detect
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+        run: |
+          API="https://api.paperspace.io"
+          RESP=$(curl -s -H "X-Api-Key: $PAPERSPACE_API_KEY" "$API/templates/getTemplates")
+          TEMPLATE_ID=$(echo "$RESP" | jq -r '.[] | select(.name | test("Ubuntu 20.04";"i")) | .id' | head -n1)
+          if [ -z "$TEMPLATE_ID" ]; then
+            echo "ERROR: nu am găsit template Ubuntu!"
+            exit 1
+          fi
+          echo "TEMPLATE_ID=$TEMPLATE_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Paperspace machine
+        id: create
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_NAME: ${{ steps.gen.outputs.MACHINE_NAME }}
+          TEMPLATE_ID: ${{ steps.detect.outputs.TEMPLATE_ID }}
+          USERNAME: ${{ steps.gen.outputs.USERNAME }}
+          PASSWORD: ${{ steps.gen.outputs.PASSWORD }}
+        run: |
+          API="https://api.paperspace.io"
+          STARTUP_SCRIPT=$(cat <<'EOS'
+          #!/bin/bash
+          apt-get update -y
+          apt-get install -y xrdp xfce4 xfce4-goodies
+          systemctl enable xrdp
+          systemctl start xrdp
+          useradd -m -s /bin/bash __USERNAME__
+          echo "__USERNAME__:__PASSWORD__" | chpasswd
+          adduser __USERNAME__ sudo
+          echo "XRDP setup complete for __USERNAME__"
+          EOS
+          )
+          STARTUP_SCRIPT="${STARTUP_SCRIPT//__USERNAME__/$USERNAME}"
+          STARTUP_SCRIPT="${STARTUP_SCRIPT//__PASSWORD__/$PASSWORD}"
+
+          PAYLOAD=$(jq -n \
+            --arg name "$MACHINE_NAME" \
+            --arg region "NY2" \
+            --arg machineType "RTX4000" \
+            --arg templateId "$TEMPLATE_ID" \
+            --arg script "$STARTUP_SCRIPT" \
+            '{machineName:$name, region:$region, machineType:$machineType, templateId:$templateId, billingType:"hourly", script:$script}')
+
+          RESP=$(curl -s -X POST "$API/machines/createSingleMachinePublic" \
+            -H "X-Api-Key: $PAPERSPACE_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$PAYLOAD")
+
+          echo "Create response:"
+          echo "$RESP"
+
+          ID=$(echo "$RESP" | jq -r '.id // .machineId // empty')
+          if [ -z "$ID" ]; then
+            echo "ERROR: nu am putut obține machineId!"
+            exit 1
+          fi
+          echo "MACHINE_ID=$ID" >> $GITHUB_OUTPUT
+
+      - name: Fetch IP (single check, fail if none)
+        id: fetch
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_ID: ${{ steps.create.outputs.MACHINE_ID }}
+        run: |
+          sleep 40
+          RESP=$(curl -s -H "X-Api-Key: $PAPERSPACE_API_KEY" "https://api.paperspace.io/machines/getMachine?machineId=$MACHINE_ID")
+          echo "Machine info:"
+          echo "$RESP"
+          IP=$(echo "$RESP" | jq -r '.publicIp // empty')
+          if [ -z "$IP" ] || [ "$IP" = "null" ]; then
+            echo "ERROR: IP-ul nu a fost alocat."
+            exit 1
+          fi
+          echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+
+      - name: Show RDP Credentials
+        run: |
+          echo "=== Linux RDP ==="
+          echo "IP: ${{ steps.fetch.outputs.PUBLIC_IP }}"
+          echo "USER: ${{ steps.gen.outputs.USERNAME }}"
+          echo "PASS: ${{ steps.gen.outputs.PASSWORD }}"
+          echo "================="
+
+      - name: Keep alive 6h then shutdown
+        if: success()
+        env:
+          PAPERSPACE_API_KEY: ${{ secrets.PAPERSPACE_API_KEY }}
+          MACHINE_ID: ${{ steps.create.outputs.MACHINE_ID }}
+        run: |
+          END=$(( $(date +%s) + 6*3600 ))
+          while [ $(date +%s) -lt $END ]; do
+            sleep 300
+          done
+          echo "Stopping VM..."
+          curl -s -X POST "https://api.paperspace.io/machines/$MACHINE_ID/stop" -H "X-Api-Key: $PAPERSPACE_API_KEY"
+          
